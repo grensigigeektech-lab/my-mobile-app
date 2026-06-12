@@ -1,0 +1,132 @@
+name: Android APK
+
+on:
+  push:
+    branches:
+      - master
+
+jobs:
+  build-apk:
+    name: Build and post APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      SLACK_CHANNEL_ID: C0B9ZT30TM3
+      SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      SUPABASE_URL: ${{ vars.SUPABASE_URL || 'https://ceenjdsyagujwgfagyjl.supabase.co' }}
+      SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNlZW5qZHN5YWd1andnZmFneWpsIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODEyMzc5NTgsImV4cCI6MjA5NjgxMzk1OH0.6NlVHdh4d2BCpx-45pdMY8I4S3YBv2jE7lWIQajCrGo' }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.13.0'
+          cache: npm
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Prepare CI helpers
+        run: chmod +x scripts/ci_step.sh scripts/upload_apk_to_slack.sh android/gradlew
+
+      - name: Validate Slack upload secrets
+        run: |
+          missing=()
+          if [ -z "${SLACK_BOT_TOKEN}" ]; then missing+=("SLACK_BOT_TOKEN"); fi
+          if [ -z "${SLACK_CHANNEL_ID}" ]; then missing+=("SLACK_CHANNEL_ID"); fi
+          if [ "${#missing[@]}" -gt 0 ]; then
+            {
+              echo "FAILED_STEP=Validate Slack upload secrets"
+              echo "FAILED_REASON<<EOF"
+              echo "Missing GitHub secret(s): ${missing[*]}. The success path must upload only the APK file to #apk, which requires a Slack bot token with files:write access."
+              echo "EOF"
+            } >> "$GITHUB_ENV"
+            exit 1
+          fi
+
+      - name: Create mobile environment
+        run: |
+          ./scripts/ci_step.sh "Create mobile environment" bash -lc '
+            if [ -z "${SUPABASE_URL}" ]; then
+              echo "SUPABASE_URL is empty"
+              exit 1
+            fi
+            if [ -z "${SUPABASE_ANON_KEY}" ]; then
+              echo "SUPABASE_ANON_KEY is empty"
+              exit 1
+            fi
+            {
+              echo "SUPABASE_URL=${SUPABASE_URL}"
+              echo "SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY}"
+            } > .env
+          '
+
+      - name: Install dependencies
+        run: ./scripts/ci_step.sh "Install dependencies" npm ci
+
+      - name: Install Android SDK packages
+        run: |
+          ./scripts/ci_step.sh "Install Android SDK packages" bash -lc '
+            yes | sdkmanager "platforms;android-36" "build-tools;36.0.0" "ndk;27.1.12297006"
+          '
+
+      - name: Run TypeScript check
+        run: ./scripts/ci_step.sh "Run TypeScript check" npm run typecheck
+
+      - name: Run lint
+        run: ./scripts/ci_step.sh "Run lint" npm run lint
+
+      - name: Run tests
+        run: ./scripts/ci_step.sh "Run tests" npm test -- --watchAll=false
+
+      - name: Build release APK
+        run: |
+          ./scripts/ci_step.sh "Build release APK" bash -lc '
+            cd android
+            ./gradlew assembleRelease --stacktrace --no-daemon
+          '
+
+      - name: Locate APK
+        run: |
+          ./scripts/ci_step.sh "Locate APK" bash -lc '
+            apk_path="$(find android/app/build/outputs/apk/release -name "*.apk" | head -n 1)"
+            if [ -z "$apk_path" ] || [ ! -f "$apk_path" ]; then
+              echo "No .apk file was found under android/app/build/outputs/apk/release"
+              exit 1
+            fi
+            echo "APK_PATH=$apk_path" >> "$GITHUB_ENV"
+          '
+
+      - name: Upload APK to Slack
+        run: ./scripts/ci_step.sh "Upload APK to Slack" ./scripts/upload_apk_to_slack.sh "$APK_PATH"
+
+      - name: Notify Slack on failure
+        if: failure()
+        run: |
+          if [ -z "${SLACK_WEBHOOK_URL}" ]; then
+            echo "SLACK_WEBHOOK_URL is missing, so the failure message could not be posted to #apk."
+            exit 0
+          fi
+
+          step="${FAILED_STEP:-Unknown step}"
+          reason="${FAILED_REASON:-No captured command output was available. Check the GitHub Actions step that failed before CI helpers ran.}"
+          text="GitHub Actions failed in step: ${step}
+          Reason:
+          ${reason}"
+
+          payload="$(jq -n --arg text "$text" '{text: $text}')"
+          curl -sS -X POST \
+            -H "Content-Type: application/json" \
+            --data "$payload" \
+            "$SLACK_WEBHOOK_URL" \
+            >/dev/null
