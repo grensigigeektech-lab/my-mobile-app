@@ -16,6 +16,8 @@ jobs:
     env:
       TZ: Asia/Kolkata
       GOOGLE_DRIVE_ENV_FILE_ID: ${{ vars.GOOGLE_DRIVE_ENV_FILE_ID || '1_gc0qpz96vgFGCNFLciH0h2gaRxSzu6TLIQbv24lKcI' }}
+      GOOGLE_DRIVE_APK_FOLDER_ID: ${{ vars.GOOGLE_DRIVE_APK_FOLDER_ID || '1UGi_3NOOuXefyyMhv_qSJFjm5W8nnop5' }}
+      GOOGLE_DRIVE_FAILURE_FOLDER_ID: ${{ vars.GOOGLE_DRIVE_FAILURE_FOLDER_ID || '1pixadbRshFbbMM9qCvt4nG-sBo8Krvcy' }}
       GOOGLE_DRIVE_PARENT_FOLDER_ID: ${{ vars.GOOGLE_DRIVE_PARENT_FOLDER_ID }}
       GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON }}
 
@@ -267,6 +269,10 @@ jobs:
 
 
           def ensure_folder(name):
+              direct_id = os.environ.get(f"GOOGLE_DRIVE_{name.upper()}_FOLDER_ID", "").strip()
+              if direct_id:
+                  return direct_id
+
               parent_id = os.environ.get("GOOGLE_DRIVE_PARENT_FOLDER_ID", "").strip()
               existing = find_child(name, parent_id, "application/vnd.google-apps.folder")
               if existing:
