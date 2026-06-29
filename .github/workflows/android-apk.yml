@@ -1,4 +1,4 @@
-name: Android APK
+name: Build Android APK
 
 on:
   push:
@@ -8,474 +8,443 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: android-apk-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
-  build-apk:
-    name: Build and upload APK
+  build-android:
+    name: Build and deliver Android APK
     runs-on: ubuntu-latest
     timeout-minutes: 60
+
     env:
-      TZ: Asia/Kolkata
-      GOOGLE_DRIVE_ENV_FILE_ID: ${{ vars.GOOGLE_DRIVE_ENV_FILE_ID || '1_gc0qpz96vgFGCNFLciH0h2gaRxSzu6TLIQbv24lKcI' }}
-      GOOGLE_DRIVE_APK_FOLDER_ID: ${{ vars.GOOGLE_DRIVE_APK_FOLDER_ID || '1UGi_3NOOuXefyyMhv_qSJFjm5W8nnop5' }}
-      GOOGLE_DRIVE_FAILURE_FOLDER_ID: ${{ vars.GOOGLE_DRIVE_FAILURE_FOLDER_ID || '1pixadbRshFbbMM9qCvt4nG-sBo8Krvcy' }}
-      GOOGLE_DRIVE_PARENT_FOLDER_ID: ${{ vars.GOOGLE_DRIVE_PARENT_FOLDER_ID }}
-      GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON }}
+      DRIVE_ENV_FILE_ID: 1_gc0qpz96vgFGCNFLciH0h2gaRxSzu6TLIQbv24lKcI
+      DRIVE_APK_FOLDER_ID: 1UGi_3NOOuXefyyMhv_qSJFjm5W8nnop5
+      DRIVE_FAILURE_FOLDER_ID: 1pixadbRshFbbMM9qCvt4nG-sBo8Krvcy
+      BUILD_LOG_DIR: /tmp/android-build-logs
 
     steps:
-      - name: Prepare Google Drive helper
+      # This is intentionally the first setup step. The target folders are in
+      # My Drive (not a shared drive), so this uses a human OAuth refresh token.
+      # Store client_id, client_secret, and refresh_token as one JSON object in
+      # the GOOGLE_DRIVE_OAUTH_JSON Actions secret; never commit it.
+      - name: Authenticate to Google Drive
+        id: drive-auth
+        continue-on-error: true
+        shell: bash
+        env:
+          GOOGLE_DRIVE_OAUTH_JSON: ${{ secrets.GOOGLE_DRIVE_OAUTH_JSON }}
         run: |
-          echo "CURRENT_STEP=Prepare Google Drive helper" >> "$GITHUB_ENV"
-          cat > "$RUNNER_TEMP/google_drive_ci.py" <<'PY'
-          import base64
-          import json
-          import os
+          set -Eeuo pipefail
+          mkdir -p "$BUILD_LOG_DIR"
+          exec > >(tee "$BUILD_LOG_DIR/drive-auth.log") 2>&1
+
+          if [[ -z "$GOOGLE_DRIVE_OAUTH_JSON" ]]; then
+            echo "Required repository secret GOOGLE_DRIVE_OAUTH_JSON is missing." >&2
+            exit 1
+          fi
+
+          CLIENT_ID="$(jq -er '.client_id' <<<"$GOOGLE_DRIVE_OAUTH_JSON")"
+          CLIENT_SECRET="$(jq -er '.client_secret' <<<"$GOOGLE_DRIVE_OAUTH_JSON")"
+          REFRESH_TOKEN="$(jq -er '.refresh_token' <<<"$GOOGLE_DRIVE_OAUTH_JSON")"
+          echo "::add-mask::$CLIENT_ID"
+          echo "::add-mask::$CLIENT_SECRET"
+          echo "::add-mask::$REFRESH_TOKEN"
+
+          RESPONSE="$(curl --fail-with-body --silent --show-error \
+            --request POST \
+            --data-urlencode "client_id=$CLIENT_ID" \
+            --data-urlencode "client_secret=$CLIENT_SECRET" \
+            --data-urlencode "refresh_token=$REFRESH_TOKEN" \
+            --data-urlencode 'grant_type=refresh_token' \
+            'https://oauth2.googleapis.com/token')"
+          ACCESS_TOKEN="$(jq -er '.access_token' <<<"$RESPONSE")"
+          echo "::add-mask::$ACCESS_TOKEN"
+          echo "access_token=$ACCESS_TOKEN" >> "$GITHUB_OUTPUT"
+          echo "Authenticated to Google Drive without exposing OAuth credentials."
+
+      - name: Read and validate environment variables from Google Drive
+        id: load-env
+        if: steps.drive-auth.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        env:
+          DRIVE_ACCESS_TOKEN: ${{ steps.drive-auth.outputs.access_token }}
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$BUILD_LOG_DIR"
+          exec > >(tee "$BUILD_LOG_DIR/load-env.log") 2>&1
+
+          ENV_DOCUMENT="$RUNNER_TEMP/google-drive-env.txt"
+          curl --fail-with-body --silent --show-error --location \
+            --header "Authorization: Bearer $DRIVE_ACCESS_TOKEN" \
+            "https://www.googleapis.com/drive/v3/files/${DRIVE_ENV_FILE_ID}/export?mimeType=text%2Fplain" \
+            --output "$ENV_DOCUMENT"
+
+          python3 - "$ENV_DOCUMENT" "$GITHUB_ENV" <<'PY'
           import re
-          import subprocess
           import sys
-          import tempfile
-          import time
-          import urllib.error
-          import urllib.parse
-          import urllib.request
-          import uuid
-          from datetime import datetime
-          from pathlib import Path
-          from zoneinfo import ZoneInfo
 
-          DRIVE_API = "https://www.googleapis.com/drive/v3"
-          DRIVE_UPLOAD_API = "https://www.googleapis.com/upload/drive/v3"
-          DRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
-          ENV_JSON_PATH = Path(os.environ.get("DRIVE_ENV_JSON_PATH", Path(os.environ["RUNNER_TEMP"]) / "drive-env.json"))
+          source_path, github_env_path = sys.argv[1:]
+          text = open(source_path, encoding="utf-8-sig").read().replace("\r\n", "\n")
+          entries = {}
+          current = None
 
-
-          def fail(message):
-              raise RuntimeError(message)
-
-
-          def service_account_info():
-              raw = os.environ.get("GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON", "").strip()
-              if not raw:
-                  fail("Missing GitHub secret GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON. Add a Google service-account JSON key that can read the Drive env file and write to the target Drive folder.")
-
-              try:
-                  return json.loads(raw)
-              except json.JSONDecodeError:
-                  try:
-                      return json.loads(base64.b64decode(raw).decode("utf-8"))
-                  except Exception as exc:
-                      fail(f"GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON is not valid raw JSON or base64 JSON: {exc}")
-
-
-          def b64url(data):
-              return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
-
-
-          def access_token():
-              info = service_account_info()
-              private_key = info.get("private_key")
-              client_email = info.get("client_email")
-              if not private_key or not client_email:
-                  fail("Google service-account JSON must include private_key and client_email.")
-
-              now = int(time.time())
-              header = {"alg": "RS256", "typ": "JWT"}
-              claim = {
-                  "iss": client_email,
-                  "scope": DRIVE_SCOPE,
-                  "aud": "https://oauth2.googleapis.com/token",
-                  "iat": now,
-                  "exp": now + 3600,
-              }
-              signing_input = f"{b64url(json.dumps(header, separators=(',', ':')).encode())}.{b64url(json.dumps(claim, separators=(',', ':')).encode())}"
-
-              with tempfile.NamedTemporaryFile("w", delete=False) as key_file:
-                  key_file.write(private_key)
-                  key_path = key_file.name
-
-              try:
-                  signature = subprocess.check_output(
-                      ["openssl", "dgst", "-sha256", "-sign", key_path],
-                      input=signing_input.encode("utf-8"),
-                  )
-              finally:
-                  try:
-                      os.unlink(key_path)
-                  except FileNotFoundError:
-                      pass
-
-              assertion = f"{signing_input}.{b64url(signature)}"
-              body = urllib.parse.urlencode({
-                  "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
-                  "assertion": assertion,
-              }).encode("utf-8")
-              response = http_request(
-                  "POST",
-                  "https://oauth2.googleapis.com/token",
-                  body=body,
-                  headers={"Content-Type": "application/x-www-form-urlencoded"},
-                  use_token=False,
-              )
-              return json.loads(response.decode("utf-8"))["access_token"]
-
-
-          def http_request(method, url, body=None, headers=None, use_token=True, expected=(200,)):
-              req = urllib.request.Request(url, data=body, method=method)
-              for key, value in (headers or {}).items():
-                  req.add_header(key, value)
-              if use_token:
-                  req.add_header("Authorization", f"Bearer {TOKEN}")
-
-              try:
-                  with urllib.request.urlopen(req, timeout=60) as response:
-                      payload = response.read()
-                      if response.status not in expected:
-                          fail(f"{method} request failed with HTTP {response.status}")
-                      return payload
-              except urllib.error.HTTPError as exc:
-                  detail = exc.read().decode("utf-8", errors="replace")[:2000]
-                  fail(f"{method} {url} failed with HTTP {exc.code}: {detail}")
-
-
-          def drive_json(method, path, payload=None, params=None):
-              query = urllib.parse.urlencode(params or {})
-              url = f"{DRIVE_API}{path}"
-              if query:
-                  url = f"{url}?{query}"
-              body = json.dumps(payload).encode("utf-8") if payload is not None else None
-              data = http_request(
-                  method,
-                  url,
-                  body=body,
-                  headers={"Content-Type": "application/json; charset=utf-8"} if body else None,
-                  expected=(200, 201),
-              )
-              return json.loads(data.decode("utf-8"))
-
-
-          def file_metadata(file_id):
-              return drive_json(
-                  "GET",
-                  f"/files/{urllib.parse.quote(file_id)}",
-                  params={
-                      "fields": "id,name,mimeType",
-                      "supportsAllDrives": "true",
-                  },
-              )
-
-
-          def download_env_text(file_id):
-              meta = file_metadata(file_id)
-              if meta["mimeType"] == "application/vnd.google-apps.document":
-                  url = f"{DRIVE_API}/files/{urllib.parse.quote(file_id)}/export?{urllib.parse.urlencode({'mimeType': 'text/plain'})}"
+          for raw in text.splitlines():
+              line = raw.strip()
+              if not line or line.startswith("#"):
+                  continue
+              match = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*[:=]\s*(.*)$", line)
+              if match:
+                  current = match.group(1)
+                  entries[current] = match.group(2).strip()
+              elif current is not None:
+                  entries[current] += line
               else:
-                  url = f"{DRIVE_API}/files/{urllib.parse.quote(file_id)}?{urllib.parse.urlencode({'alt': 'media', 'supportsAllDrives': 'true'})}"
-              return http_request("GET", url).decode("utf-8-sig").replace("\r\n", "\n").replace("\r", "\n")
+                  raise SystemExit("The Google Drive env file has text before its first NAME=value or NAME: value entry.")
 
+          required_mobile = ("SUPABASE_URL", "SUPABASE_ANON_KEY")
+          missing = [key for key in required_mobile if not entries.get(key)]
+          if missing:
+              raise SystemExit("Missing required mobile variable(s) in the Google Drive env file: " + ", ".join(missing))
 
-          def parse_env(text):
-              values = {}
-              lines = [line.strip() for line in text.split("\n")]
-              index = 0
-              pattern = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\s*[:=]\s*(.*)$")
+          # Mask every value found in the Drive document before later steps run.
+          # Only the public mobile values are exported to the Android build.
+          for value in entries.values():
+              escaped = value.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+              print(f"::add-mask::{escaped}")
 
-              while index < len(lines):
-                  line = lines[index]
-                  index += 1
-                  if not line or line.startswith("#"):
-                      continue
-                  match = pattern.match(line)
-                  if not match:
-                      continue
+          with open(github_env_path, "a", encoding="utf-8") as github_env:
+              for key in required_mobile:
+                  github_env.write(f"{key}<<DRIVE_ENV_EOF\n{entries[key]}\nDRIVE_ENV_EOF\n")
 
-                  key, value = match.group(1), match.group(2).strip()
-                  if not value:
-                      while index < len(lines) and not lines[index]:
-                          index += 1
-                      if index < len(lines) and not pattern.match(lines[index]):
-                          value = lines[index].strip()
-                          index += 1
-                  values[key] = value
-
-              return values
-
-
-          def mask_values(values):
-              for value in values.values():
-                  if value:
-                      print(f"::add-mask::{value}")
-
-
-          def read_env():
-              file_id = os.environ.get("GOOGLE_DRIVE_ENV_FILE_ID", "").strip()
-              if not file_id:
-                  fail("GOOGLE_DRIVE_ENV_FILE_ID is empty.")
-
-              values = parse_env(download_env_text(file_id))
-              missing = [key for key in ("SUPABASE_URL", "SUPABASE_ANON_KEY") if not values.get(key)]
-              if missing:
-                  fail(f"Drive env file is missing required mobile key(s): {', '.join(missing)}")
-
-              mask_values(values)
-              ENV_JSON_PATH.write_text(json.dumps(values, indent=2), encoding="utf-8")
-              with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env_file:
-                  env_file.write(f"DRIVE_ENV_JSON_PATH={ENV_JSON_PATH}\n")
-              print(f"Loaded {len(values)} environment variable(s) from Google Drive.")
-
-
-          def write_mobile_env():
-              values = json.loads(ENV_JSON_PATH.read_text(encoding="utf-8"))
-              mobile_keys = ("SUPABASE_URL", "SUPABASE_ANON_KEY")
-              missing = [key for key in mobile_keys if not values.get(key)]
-              if missing:
-                  fail(f"Cannot create .env; missing required key(s): {', '.join(missing)}")
-
-              mask_values(values)
-              with open(".env", "w", encoding="utf-8") as dotenv:
-                  for key in mobile_keys:
-                      dotenv.write(f"{key}={values[key]}\n")
-              with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env_file:
-                  for key in mobile_keys:
-                      env_file.write(f"{key}={values[key]}\n")
-              print("Created mobile .env from the Google Drive env file.")
-
-
-          def escape_query(value):
-              return value.replace("\\", "\\\\").replace("'", "\\'")
-
-
-          def find_child(name, parent_id, mime_type=None):
-              clauses = [f"name = '{escape_query(name)}'", "trashed = false"]
-              if parent_id:
-                  clauses.append(f"'{escape_query(parent_id)}' in parents")
-              else:
-                  clauses.append("'root' in parents")
-              if mime_type:
-                  clauses.append(f"mimeType = '{escape_query(mime_type)}'")
-
-              result = drive_json(
-                  "GET",
-                  "/files",
-                  params={
-                      "q": " and ".join(clauses),
-                      "fields": "files(id,name,mimeType,webViewLink)",
-                      "spaces": "drive",
-                      "corpora": "allDrives",
-                      "supportsAllDrives": "true",
-                      "includeItemsFromAllDrives": "true",
-                  },
-              )
-              files = result.get("files", [])
-              return files[0] if files else None
-
-
-          def ensure_folder(name):
-              direct_id = os.environ.get(f"GOOGLE_DRIVE_{name.upper()}_FOLDER_ID", "").strip()
-              if direct_id:
-                  return direct_id
-
-              parent_id = os.environ.get("GOOGLE_DRIVE_PARENT_FOLDER_ID", "").strip()
-              existing = find_child(name, parent_id, "application/vnd.google-apps.folder")
-              if existing:
-                  return existing["id"]
-
-              metadata = {"name": name, "mimeType": "application/vnd.google-apps.folder"}
-              if parent_id:
-                  metadata["parents"] = [parent_id]
-              created = drive_json(
-                  "POST",
-                  "/files",
-                  payload=metadata,
-                  params={"fields": "id,name", "supportsAllDrives": "true"},
-              )
-              return created["id"]
-
-
-          def multipart_upload(metadata, content, mime_type):
-              boundary = f"codex-{uuid.uuid4().hex}"
-              body = b"".join([
-                  f"--{boundary}\r\n".encode(),
-                  b"Content-Type: application/json; charset=UTF-8\r\n\r\n",
-                  json.dumps(metadata).encode("utf-8"),
-                  b"\r\n",
-                  f"--{boundary}\r\n".encode(),
-                  f"Content-Type: {mime_type}\r\n\r\n".encode(),
-                  content,
-                  b"\r\n",
-                  f"--{boundary}--\r\n".encode(),
-              ])
-              response = http_request(
-                  "POST",
-                  f"{DRIVE_UPLOAD_API}/files?{urllib.parse.urlencode({'uploadType': 'multipart', 'supportsAllDrives': 'true', 'fields': 'id,name,webViewLink'})}",
-                  body=body,
-                  headers={"Content-Type": f"multipart/related; boundary={boundary}"},
-                  expected=(200, 201),
-              )
-              return json.loads(response.decode("utf-8"))
-
-
-          def media_update(file_id, content, mime_type):
-              response = http_request(
-                  "PATCH",
-                  f"{DRIVE_UPLOAD_API}/files/{urllib.parse.quote(file_id)}?{urllib.parse.urlencode({'uploadType': 'media', 'supportsAllDrives': 'true', 'fields': 'id,name,webViewLink'})}",
-                  body=content,
-                  headers={"Content-Type": mime_type},
-                  expected=(200,),
-              )
-              return json.loads(response.decode("utf-8"))
-
-
-          def upload_apk(apk_path):
-              path = Path(apk_path)
-              if not path.is_file():
-                  fail(f"APK file was not found at {apk_path}")
-
-              folder_id = ensure_folder("APK")
-              short_sha = os.environ.get("GITHUB_SHA", "")[:7] or "unknown"
-              run_number = os.environ.get("GITHUB_RUN_NUMBER", "0")
-              today = datetime.now(ZoneInfo(os.environ.get("TZ", "Asia/Kolkata"))).strftime("%Y-%m-%d")
-              name = f"my-mobile-app-{today}-run-{run_number}-{short_sha}.apk"
-              created = multipart_upload(
-                  {"name": name, "parents": [folder_id]},
-                  path.read_bytes(),
-                  "application/vnd.android.package-archive",
-              )
-              print(f"Uploaded APK to Google Drive folder APK as {created['name']} ({created['id']}).")
-
-
-          def upload_failure():
-              folder_id = ensure_folder("Failure")
-              today = datetime.now(ZoneInfo(os.environ.get("TZ", "Asia/Kolkata"))).strftime("%Y-%m-%d")
-              name = f"{today}.txt"
-              step = os.environ.get("FAILED_STEP") or os.environ.get("CURRENT_STEP") or "Unknown step"
-              reason = os.environ.get("FAILED_REASON") or "No command output was captured. The failure likely occurred in a GitHub-managed action step; open the workflow run logs for the platform-level error."
-              content = "\n".join([
-                  "GitHub Actions Android APK build failed.",
-                  f"Repository: {os.environ.get('GITHUB_REPOSITORY', '')}",
-                  f"Workflow: {os.environ.get('GITHUB_WORKFLOW', '')}",
-                  f"Run ID: {os.environ.get('GITHUB_RUN_ID', '')}",
-                  f"Run number: {os.environ.get('GITHUB_RUN_NUMBER', '')}",
-                  f"Branch: {os.environ.get('GITHUB_REF_NAME', '')}",
-                  f"Commit: {os.environ.get('GITHUB_SHA', '')}",
-                  f"Failed step: {step}",
-                  "",
-                  "Reason:",
-                  reason,
-                  "",
-              ]).encode("utf-8")
-
-              existing = find_child(name, folder_id, "text/plain")
-              if existing:
-                  saved = media_update(existing["id"], content, "text/plain")
-              else:
-                  saved = multipart_upload(
-                      {"name": name, "mimeType": "text/plain", "parents": [folder_id]},
-                      content,
-                      "text/plain; charset=utf-8",
-                  )
-              print(f"Saved failure report to Google Drive folder Failure as {saved['name']} ({saved['id']}).")
-
-
-          command = sys.argv[1] if len(sys.argv) > 1 else ""
-          TOKEN = access_token()
-          if command == "read-env":
-              read_env()
-          elif command == "write-mobile-env":
-              write_mobile_env()
-          elif command == "upload-apk":
-              upload_apk(sys.argv[2])
-          elif command == "upload-failure":
-              upload_failure()
-          else:
-              fail("Usage: google_drive_ci.py read-env | write-mobile-env | upload-apk <path> | upload-failure")
+          print(f"Read and validated {len(entries)} environment variable(s) from Google Drive.")
+          print("Exported only SUPABASE_URL and SUPABASE_ANON_KEY to the mobile build.")
           PY
 
-      - name: Read environment from Google Drive
-        run: |
-          echo "CURRENT_STEP=Read environment from Google Drive" >> "$GITHUB_ENV"
-          python3 "$RUNNER_TEMP/google_drive_ci.py" read-env
+          chmod 600 "$ENV_DOCUMENT"
 
       - name: Check out repository
+        id: checkout
+        if: steps.load-env.outcome == 'success'
+        continue-on-error: true
         uses: actions/checkout@v4
 
-      - name: Create mobile environment
+      - name: Create mobile-safe .env
+        id: mobile-env
+        if: steps.checkout.outcome == 'success'
+        continue-on-error: true
+        shell: bash
         run: |
-          echo "CURRENT_STEP=Create mobile environment" >> "$GITHUB_ENV"
-          python3 "$RUNNER_TEMP/google_drive_ci.py" write-mobile-env
+          set -Eeuo pipefail
+          mkdir -p "$BUILD_LOG_DIR"
+          exec > >(tee "$BUILD_LOG_DIR/mobile-env.log") 2>&1
+          {
+            printf 'SUPABASE_URL=%s\n' "$SUPABASE_URL"
+            printf 'SUPABASE_ANON_KEY=%s\n' "$SUPABASE_ANON_KEY"
+          } > .env
+          chmod 600 .env
+          echo "Created a masked, mobile-safe .env from the Google Drive source."
 
-      - name: Set up Node.js
+      - name: Set up Node.js 22
+        id: setup-node
+        if: steps.mobile-env.outcome == 'success'
+        continue-on-error: true
         uses: actions/setup-node@v4
         with:
-          node-version: '22.13.0'
+          node-version: '22.11.0'
           cache: npm
 
-      - name: Set up Java
+      - name: Set up Java 17
+        id: setup-java
+        if: steps.setup-node.outcome == 'success'
+        continue-on-error: true
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
+          cache: gradle
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Prepare repository scripts
-        run: |
-          echo "CURRENT_STEP=Prepare repository scripts" >> "$GITHUB_ENV"
-          chmod +x scripts/ci_step.sh android/gradlew
-
-      - name: Install dependencies
-        run: |
-          echo "CURRENT_STEP=Install dependencies" >> "$GITHUB_ENV"
-          ./scripts/ci_step.sh "Install dependencies" npm ci
-
-      - name: Install Android SDK packages
-        run: |
-          echo "CURRENT_STEP=Install Android SDK packages" >> "$GITHUB_ENV"
-          ./scripts/ci_step.sh "Install Android SDK packages" bash -lc '
-            yes | sdkmanager "platforms;android-36" "build-tools;36.0.0" "ndk;27.1.12297006"
-          '
-
-      - name: Run TypeScript check
-        run: |
-          echo "CURRENT_STEP=Run TypeScript check" >> "$GITHUB_ENV"
-          ./scripts/ci_step.sh "Run TypeScript check" npm run typecheck
-
-      - name: Run lint
-        run: |
-          echo "CURRENT_STEP=Run lint" >> "$GITHUB_ENV"
-          ./scripts/ci_step.sh "Run lint" npm run lint
-
-      - name: Run tests
-        run: |
-          echo "CURRENT_STEP=Run tests" >> "$GITHUB_ENV"
-          ./scripts/ci_step.sh "Run tests" npm test -- --watchAll=false
-
-      - name: Build release APK
-        run: |
-          echo "CURRENT_STEP=Build release APK" >> "$GITHUB_ENV"
-          ./scripts/ci_step.sh "Build release APK" bash -lc '
-            cd android
-            ./gradlew assembleRelease --stacktrace --no-daemon
-          '
-
-      - name: Locate APK
-        run: |
-          echo "CURRENT_STEP=Locate APK" >> "$GITHUB_ENV"
-          ./scripts/ci_step.sh "Locate APK" bash -lc '
-            apk_path="$(find android/app/build/outputs/apk/release -name "*.apk" | head -n 1)"
-            if [ -z "$apk_path" ] || [ ! -f "$apk_path" ]; then
-              echo "No .apk file was found under android/app/build/outputs/apk/release"
-              exit 1
-            fi
-            echo "APK_PATH=$apk_path" >> "$GITHUB_ENV"
-          '
-
-      - name: Upload APK to Google Drive
-        run: |
-          echo "CURRENT_STEP=Upload APK to Google Drive" >> "$GITHUB_ENV"
-          ./scripts/ci_step.sh "Upload APK to Google Drive" python3 "$RUNNER_TEMP/google_drive_ci.py" upload-apk "$APK_PATH"
-
-      - name: Save failure report to Google Drive
-        if: failure()
+      - name: Install JavaScript dependencies
+        id: npm-ci
+        if: steps.setup-java.outcome == 'success'
         continue-on-error: true
+        shell: bash
         run: |
-          python3 "$RUNNER_TEMP/google_drive_ci.py" upload-failure
+          set -Eeuo pipefail
+          mkdir -p "$BUILD_LOG_DIR"
+          exec > >(tee "$BUILD_LOG_DIR/npm-ci.log") 2>&1
+          node --version
+          npm --version
+          npm ci --no-audit --no-fund
+
+      - name: Compile release APK
+        id: gradle-build
+        if: steps.npm-ci.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        working-directory: android
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$BUILD_LOG_DIR"
+          exec > >(tee "$BUILD_LOG_DIR/gradle-build.log") 2>&1
+          chmod +x gradlew
+          ./gradlew --no-daemon --console=plain --stacktrace assembleRelease
+
+          APK_PATH="$(find app/build/outputs/apk/release -maxdepth 1 -type f -name '*.apk' -print -quit)"
+          if [[ -z "$APK_PATH" || ! -s "$APK_PATH" ]]; then
+            echo "Gradle completed, but no non-empty release APK was found in android/app/build/outputs/apk/release/." >&2
+            exit 1
+          fi
+          echo "apk_path=$PWD/$APK_PATH" >> "$GITHUB_OUTPUT"
+          echo "Release APK: $APK_PATH"
+
+      # Refresh the one-hour access token after the potentially long Gradle build.
+      - name: Refresh Google Drive access token
+        id: drive-auth-upload
+        if: always() && steps.drive-auth.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        env:
+          GOOGLE_DRIVE_OAUTH_JSON: ${{ secrets.GOOGLE_DRIVE_OAUTH_JSON }}
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$BUILD_LOG_DIR"
+          exec > >(tee "$BUILD_LOG_DIR/drive-auth-upload.log") 2>&1
+
+          CLIENT_ID="$(jq -er '.client_id' <<<"$GOOGLE_DRIVE_OAUTH_JSON")"
+          CLIENT_SECRET="$(jq -er '.client_secret' <<<"$GOOGLE_DRIVE_OAUTH_JSON")"
+          REFRESH_TOKEN="$(jq -er '.refresh_token' <<<"$GOOGLE_DRIVE_OAUTH_JSON")"
+          echo "::add-mask::$CLIENT_ID"
+          echo "::add-mask::$CLIENT_SECRET"
+          echo "::add-mask::$REFRESH_TOKEN"
+
+          RESPONSE="$(curl --fail-with-body --silent --show-error \
+            --request POST \
+            --data-urlencode "client_id=$CLIENT_ID" \
+            --data-urlencode "client_secret=$CLIENT_SECRET" \
+            --data-urlencode "refresh_token=$REFRESH_TOKEN" \
+            --data-urlencode 'grant_type=refresh_token' \
+            'https://oauth2.googleapis.com/token')"
+          ACCESS_TOKEN="$(jq -er '.access_token' <<<"$RESPONSE")"
+          echo "::add-mask::$ACCESS_TOKEN"
+          echo "access_token=$ACCESS_TOKEN" >> "$GITHUB_OUTPUT"
+          echo "Refreshed the Google Drive access token for artifact delivery."
+
+      - name: Upload successful APK to Google Drive APK folder
+        id: upload-apk
+        if: steps.gradle-build.outcome == 'success' && steps.drive-auth-upload.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        env:
+          DRIVE_ACCESS_TOKEN: ${{ steps.drive-auth-upload.outputs.access_token }}
+          APK_PATH: ${{ steps.gradle-build.outputs.apk_path }}
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$BUILD_LOG_DIR"
+          exec > >(tee "$BUILD_LOG_DIR/upload-apk.log") 2>&1
+
+          FILE_NAME="my-mobile-app-${GITHUB_SHA:0:12}.apk"
+          META="$(jq -cn --arg name "$FILE_NAME" --arg parent "$DRIVE_APK_FOLDER_ID" \
+            '{name: $name, parents: [$parent]}')"
+          HEADERS="$RUNNER_TEMP/drive-upload-apk-headers.txt"
+
+          curl --fail-with-body --silent --show-error --dump-header "$HEADERS" --output "$RUNNER_TEMP/drive-upload-apk-init.json" \
+            --request POST \
+            --header "Authorization: Bearer $DRIVE_ACCESS_TOKEN" \
+            --header 'Content-Type: application/json; charset=UTF-8' \
+            --header "X-Upload-Content-Type: application/vnd.android.package-archive" \
+            --header "X-Upload-Content-Length: $(stat -c%s "$APK_PATH")" \
+            --data "$META" \
+            'https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&supportsAllDrives=true'
+
+          LOCATION="$(awk 'BEGIN {IGNORECASE=1} /^location:/ {sub(/^[^:]*:[[:space:]]*/, ""); sub(/\r$/, ""); print; exit}' "$HEADERS")"
+          if [[ -z "$LOCATION" ]]; then
+            echo "Google Drive did not return a resumable upload URL." >&2
+            cat "$RUNNER_TEMP/drive-upload-apk-init.json" >&2
+            exit 1
+          fi
+
+          RESPONSE="$(curl --fail-with-body --silent --show-error \
+            --request PUT \
+            --header 'Content-Type: application/vnd.android.package-archive' \
+            --data-binary "@$APK_PATH" \
+            "$LOCATION")"
+          FILE_ID="$(jq -r '.id // empty' <<<"$RESPONSE")"
+          if [[ -z "$FILE_ID" ]]; then
+            echo "Google Drive completed the upload without returning a file ID." >&2
+            exit 1
+          fi
+          echo "APK uploaded to Google Drive as $FILE_NAME (file ID: $FILE_ID)."
+
+      - name: Write a precise failure report
+        id: failure-report
+        if: always()
+        continue-on-error: true
+        shell: bash
+        env:
+          AUTH_OUTCOME: ${{ steps.drive-auth.outcome }}
+          ENV_OUTCOME: ${{ steps.load-env.outcome }}
+          CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
+          MOBILE_ENV_OUTCOME: ${{ steps.mobile-env.outcome }}
+          NODE_OUTCOME: ${{ steps.setup-node.outcome }}
+          JAVA_OUTCOME: ${{ steps.setup-java.outcome }}
+          NPM_OUTCOME: ${{ steps.npm-ci.outcome }}
+          BUILD_OUTCOME: ${{ steps.gradle-build.outcome }}
+          REFRESH_AUTH_OUTCOME: ${{ steps.drive-auth-upload.outcome }}
+          APK_UPLOAD_OUTCOME: ${{ steps.upload-apk.outcome }}
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$BUILD_LOG_DIR"
+          REPORT_DATE="$(TZ=Asia/Kolkata date +%F)"
+          REPORT="$RUNNER_TEMP/${REPORT_DATE}.txt"
+          HAS_FAILURE=false
+
+          declare -a RECORDS=(
+            "Authenticate to Google Drive|$AUTH_OUTCOME|drive-auth.log"
+            "Read and validate environment variables from Google Drive|$ENV_OUTCOME|load-env.log"
+            "Check out repository|$CHECKOUT_OUTCOME|"
+            "Create mobile-safe .env|$MOBILE_ENV_OUTCOME|mobile-env.log"
+            "Set up Node.js 22|$NODE_OUTCOME|"
+            "Set up Java 17|$JAVA_OUTCOME|"
+            "Install JavaScript dependencies|$NPM_OUTCOME|npm-ci.log"
+            "Compile release APK|$BUILD_OUTCOME|gradle-build.log"
+            "Refresh Google Drive access token|$REFRESH_AUTH_OUTCOME|drive-auth-upload.log"
+            "Upload successful APK to Google Drive APK folder|$APK_UPLOAD_OUTCOME|upload-apk.log"
+          )
+
+          {
+            echo "Android APK build failure"
+            echo "Date: $REPORT_DATE (Asia/Kolkata)"
+            echo "Repository: $GITHUB_REPOSITORY"
+            echo "Commit: $GITHUB_SHA"
+            echo "Workflow run: https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo
+
+            for record in "${RECORDS[@]}"; do
+              IFS='|' read -r step outcome log_file <<<"$record"
+              if [[ "$outcome" == "failure" || "$outcome" == "cancelled" ]]; then
+                HAS_FAILURE=true
+                echo "FAILED STEP: $step"
+                echo "GitHub Actions outcome: $outcome"
+                if [[ -n "$log_file" && -s "$BUILD_LOG_DIR/$log_file" ]]; then
+                  echo "Reason and final diagnostic output:"
+                  tail -n 160 "$BUILD_LOG_DIR/$log_file"
+                else
+                  echo "Reason: The GitHub Action failed before command-level diagnostics could be captured. Open the workflow-run link above for the action's full error message."
+                fi
+                echo
+              fi
+            done
+          } > "$REPORT"
+
+          if [[ "$HAS_FAILURE" == "true" ]]; then
+            echo "has_failure=true" >> "$GITHUB_OUTPUT"
+            echo "report_path=$REPORT" >> "$GITHUB_OUTPUT"
+            echo "report_name=${REPORT_DATE}.txt" >> "$GITHUB_OUTPUT"
+            echo "Created $REPORT with the failed step(s) and diagnostic output."
+          else
+            rm -f "$REPORT"
+            echo "has_failure=false" >> "$GITHUB_OUTPUT"
+            echo "All required steps succeeded; no failure report was created."
+          fi
+
+      - name: Save failure report to Google Drive Failure folder
+        id: upload-failure
+        if: always() && steps.failure-report.outputs.has_failure == 'true' && steps.drive-auth-upload.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        env:
+          DRIVE_ACCESS_TOKEN: ${{ steps.drive-auth-upload.outputs.access_token }}
+          REPORT_PATH: ${{ steps.failure-report.outputs.report_path }}
+          REPORT_NAME: ${{ steps.failure-report.outputs.report_name }}
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$BUILD_LOG_DIR"
+          exec > >(tee "$BUILD_LOG_DIR/upload-failure.log") 2>&1
+
+          # A date has one canonical report. Update today's file if a rerun or
+          # later push already created it; otherwise create it.
+          QUERY="name = '$REPORT_NAME' and '$DRIVE_FAILURE_FOLDER_ID' in parents and trashed = false"
+          LIST_RESPONSE="$(curl --fail-with-body --silent --show-error --get \
+            --header "Authorization: Bearer $DRIVE_ACCESS_TOKEN" \
+            --data-urlencode "q=$QUERY" \
+            --data-urlencode 'fields=files(id,name)' \
+            --data-urlencode 'supportsAllDrives=true' \
+            --data-urlencode 'includeItemsFromAllDrives=true' \
+            'https://www.googleapis.com/drive/v3/files')"
+          EXISTING_ID="$(jq -r '.files[0].id // empty' <<<"$LIST_RESPONSE")"
+
+          META="$(jq -cn --arg name "$REPORT_NAME" --arg parent "$DRIVE_FAILURE_FOLDER_ID" \
+            '{name: $name, parents: [$parent]}')"
+          HEADERS="$RUNNER_TEMP/drive-upload-failure-headers.txt"
+
+          if [[ -n "$EXISTING_ID" ]]; then
+            START_URL="https://www.googleapis.com/upload/drive/v3/files/${EXISTING_ID}?uploadType=resumable&supportsAllDrives=true"
+            METHOD=PATCH
+            META="$(jq -cn --arg name "$REPORT_NAME" '{name: $name}')"
+          else
+            START_URL='https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&supportsAllDrives=true'
+            METHOD=POST
+          fi
+
+          curl --fail-with-body --silent --show-error --dump-header "$HEADERS" --output "$RUNNER_TEMP/drive-upload-failure-init.json" \
+            --request "$METHOD" \
+            --header "Authorization: Bearer $DRIVE_ACCESS_TOKEN" \
+            --header 'Content-Type: application/json; charset=UTF-8' \
+            --header 'X-Upload-Content-Type: text/plain; charset=UTF-8' \
+            --header "X-Upload-Content-Length: $(stat -c%s "$REPORT_PATH")" \
+            --data "$META" \
+            "$START_URL"
+
+          LOCATION="$(awk 'BEGIN {IGNORECASE=1} /^location:/ {sub(/^[^:]*:[[:space:]]*/, ""); sub(/\r$/, ""); print; exit}' "$HEADERS")"
+          if [[ -z "$LOCATION" ]]; then
+            echo "Google Drive did not return a resumable upload URL for the failure report." >&2
+            cat "$RUNNER_TEMP/drive-upload-failure-init.json" >&2
+            exit 1
+          fi
+
+          RESPONSE="$(curl --fail-with-body --silent --show-error \
+            --request PUT \
+            --header 'Content-Type: text/plain; charset=UTF-8' \
+            --data-binary "@$REPORT_PATH" \
+            "$LOCATION")"
+          FILE_ID="$(jq -r '.id // empty' <<<"$RESPONSE")"
+          if [[ -z "$FILE_ID" ]]; then
+            echo "Google Drive completed the failure-report upload without returning a file ID." >&2
+            exit 1
+          fi
+          echo "Failure report saved as $REPORT_NAME in the Google Drive Failure folder (file ID: $FILE_ID)."
+
+      - name: Set final workflow result
+        if: always()
+        shell: bash
+        env:
+          AUTH_OUTCOME: ${{ steps.drive-auth.outcome }}
+          ENV_OUTCOME: ${{ steps.load-env.outcome }}
+          CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
+          MOBILE_ENV_OUTCOME: ${{ steps.mobile-env.outcome }}
+          NODE_OUTCOME: ${{ steps.setup-node.outcome }}
+          JAVA_OUTCOME: ${{ steps.setup-java.outcome }}
+          NPM_OUTCOME: ${{ steps.npm-ci.outcome }}
+          BUILD_OUTCOME: ${{ steps.gradle-build.outcome }}
+          REFRESH_AUTH_OUTCOME: ${{ steps.drive-auth-upload.outcome }}
+          APK_UPLOAD_OUTCOME: ${{ steps.upload-apk.outcome }}
+          FAILURE_PRESENT: ${{ steps.failure-report.outputs.has_failure }}
+          FAILURE_UPLOAD_OUTCOME: ${{ steps.upload-failure.outcome }}
+        run: |
+          set -Eeuo pipefail
+          for outcome in \
+            "$AUTH_OUTCOME" "$ENV_OUTCOME" "$CHECKOUT_OUTCOME" "$MOBILE_ENV_OUTCOME" \
+            "$NODE_OUTCOME" "$JAVA_OUTCOME" "$NPM_OUTCOME" "$BUILD_OUTCOME" \
+            "$REFRESH_AUTH_OUTCOME" "$APK_UPLOAD_OUTCOME"; do
+            [[ "$outcome" == "success" ]] || exit 1
+          done
+
+          if [[ "$FAILURE_PRESENT" == "true" && "$FAILURE_UPLOAD_OUTCOME" != "success" ]]; then
+            echo "The build failed and the required Google Drive failure report could not be uploaded." >&2
+            exit 1
+          fi
+
+          echo "Android release APK build and Google Drive upload both succeeded."
